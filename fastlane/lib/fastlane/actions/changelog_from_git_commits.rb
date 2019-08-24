@@ -16,9 +16,16 @@ module Fastlane
               from, to = params[:between]
             end
           else
-            from = Actions.last_git_tag_name(params[:match_lightweight_tag], params[:tag_match_pattern])
-            UI.verbose("Found the last Git tag: #{from}")
-            to = 'HEAD'
+            if params[:tag_match_pattern]
+              UI.message("param: #{params[:tag_match_pattern]}")
+              from = Actions.last_git_tag_name(params[:match_lightweight_tag], params[:tag_match_pattern])
+              UI.verbose("Found the last Git tag: #{from}")
+              to = 'HEAD'
+            else
+              UI.important("No Git tag provided, perhaps this was intentional?")
+              commitNoTag = Actions.last_git_commit_message
+              UI.important("Using the last commit message: #{commitNoTag}")
+              end
           end
           UI.success("Collecting Git commits between #{from} and #{to}")
         end
@@ -39,8 +46,12 @@ module Fastlane
           if params[:commits_count]
             changelog = Actions.git_log_last_commits(params[:pretty], params[:commits_count], merge_commit_filtering, params[:date_format], params[:ancestry_path])
           else
+            if commitNoTag
+              changelog = commitNoTag
+            else
             changelog = Actions.git_log_between(params[:pretty], from, to, merge_commit_filtering, params[:date_format], params[:ancestry_path])
-          end
+            end
+            end
 
           changelog = changelog.gsub("\n\n", "\n") if changelog # as there are duplicate newlines
           Actions.lane_context[SharedValues::FL_CHANGELOG] = changelog
