@@ -18,6 +18,7 @@ module Snapshot
 
     def initialize(launcher_configuration: nil)
       @launcher_config = launcher_configuration
+      @device_boot_datetime = DateTime.now
     end
 
     def collected_errors
@@ -75,6 +76,11 @@ module Snapshot
         if launcher_config.disable_slide_to_type
           disable_slide_to_type(type)
         end
+      end
+
+      unless launcher_config.headless
+        simulator_path = File.join(Helper.xcode_path, 'Applications', 'Simulator.app')
+        Helper.backticks("open -a #{simulator_path} -g", print: FastlaneCore::Globals.verbose?)
       end
     end
 
@@ -187,7 +193,7 @@ module Snapshot
 
         UI.header("Collecting system logs #{device_name} - #{language}")
         log_identity = Digest::MD5.hexdigest(components.join("-"))
-        FastlaneCore::Simulator.copy_logs(device, log_identity, language_folder)
+        FastlaneCore::Simulator.copy_logs(device, log_identity, language_folder, @device_boot_datetime)
       end
     end
   end

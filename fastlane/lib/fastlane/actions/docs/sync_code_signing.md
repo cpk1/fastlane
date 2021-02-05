@@ -111,9 +111,28 @@ match
 
 You can find more information about GitHub basic authentication and personal token generation here: [https://developer.github.com/v3/auth/#basic-authentication](https://developer.github.com/v3/auth/#basic-authentication)
 
-##### Git Storage on Azure Devops
+##### Git Storage on GitHub - Deploy keys
 
-If you're running a pipeline on Azure Devops and using git storage in a another repository on the same project, you might want to use `bearer` token authentication.
+If your machine does not have a private key set up for your certificates repository, you can give _match_ a path for one:
+
+Using parameter:
+
+```
+match(git_private_key: '<PATH TO YOUR KEY>')
+```
+
+Using environment variable:
+
+```
+ENV['MATCH_GIT_PRIVATE_KEY'] = '<PATH TO YOUR KEY>'
+match
+```
+
+You can find more information about GitHub basic authentication and personal token generation here: [https://developer.github.com/v3/auth/#basic-authentication](https://developer.github.com/v3/auth/#basic-authentication)
+
+##### Git Storage on Azure DevOps
+
+If you're running a pipeline on Azure DevOps and using git storage in a another repository on the same project, you might want to use `bearer` token authentication.
 
 Using parameter:
 
@@ -371,7 +390,7 @@ lane :beta do
 end
 ```
 
-By using the `force_for_new_devices` parameter, _match_ will check if the device count has changed since the last time you ran _match_, and automatically re-generate the provisioning profile if necessary. You can also use `force: true` to re-generate the provisioning profile on each run.
+By using the `force_for_new_devices` parameter, _match_ will check if the (enabled) device count has changed since the last time you ran _match_, and automatically re-generate the provisioning profile if necessary. You can also use `force: true` to re-generate the provisioning profile on each run.
 
 _**Important:** The `force_for_new_devices` parameter is ignored for App Store provisioning profiles since they don't contain any device information._
 
@@ -473,6 +492,15 @@ fastlane match import
 
 You'll be prompted for the certificate (`.cer`), the private key (`.p12`) and the provisioning profiles (`.mobileprovision` or `.provisionprofile`) paths. _match_ will first validate the certificate (`.cer`) against the Developer Portal before importing the certificate, the private key and the provisioning profiles into the specified _match_ repository.
 
+However if there is no access to the developer portal but there are certificates, private keys and profiles provided, you can use the `skip_certificate_matching` option to tell _match_ not to verify the certificates. Like this:
+
+```no-highlight
+fastlane match import --skip_certificate_matching true
+```
+This will skip login to Apple Developer Portal and will import the provided certificate, private key and profile directly to the certificates repo.
+
+Please be careful when using this option and ensure the certificates and profiles match the type (development, adhoc, appstore, enterprise, developer_id) and are not revoked or expired.
+
 ### Manual Decrypt
 
 If you want to manually decrypt a file you can.
@@ -488,14 +516,14 @@ _match_ stores the certificate (`.cer`) and the private key (`.p12`) files separ
 Decrypt your cert found in `certs/<type>/<unique-id>.cer` as a pem file:
 
 ```no-highlight
-openssl aes-256-cbc -k "<password>" -in "certs/<type>/<unique-id>.cer" -out "cert.der" -a -d
+openssl aes-256-cbc -k "<password>" -in "certs/<type>/<unique-id>.cer" -out "cert.der" -a -d -md [md5|sha256]
 openssl x509 -inform der -in cert.der -out cert.pem
 ```
 
 Decrypt your private key found in `certs/<type>/<unique-id>.p12` as a pem file:
 
 ```no-highlight
-openssl aes-256-cbc -k "<password>" -in "certs/distribution/<unique-id>.p12" -out "key.pem" -a -d
+openssl aes-256-cbc -k "<password>" -in "certs/distribution/<unique-id>.p12" -out "key.pem" -a -d -md [md5|sha256]
 ```
 
 Generate an encrypted p12 file with the same or new password:
@@ -514,7 +542,7 @@ Storing your private keys in a Git repo may sound off-putting at first. We did a
 
 ### Google Cloud Storage
 
-All your keys and provisioning profiles are encrypted using Google managed keys. 
+All your keys and provisioning profiles are encrypted using Google managed keys.
 
 ### What could happen if someone stole a private key?
 

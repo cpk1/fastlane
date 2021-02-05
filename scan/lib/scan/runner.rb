@@ -16,6 +16,7 @@ module Scan
   class Runner
     def initialize
       @test_command_generator = TestCommandGenerator.new
+      @device_boot_datetime = DateTime.now
     end
 
     def run
@@ -39,12 +40,7 @@ module Scan
         end
       end
 
-      # We call this method, to be sure that all other simulators are killed
-      # And a correct one is freshly launched. Switching between multiple simulator
-      # in case the user specified multiple targets works with no issues
-      # This way it's okay to just call it for the first simulator we're using for
-      # the first test run
-      FastlaneCore::Simulator.launch(Scan.devices.first) if Scan.devices && Scan.config[:prelaunch_simulator]
+      prelaunch_simulators
 
       if Scan.config[:reinstall_app]
         app_identifier = Scan.config[:app_identifier]
@@ -87,6 +83,13 @@ module Scan
     end
 
     def handle_results(tests_exit_status)
+      if Scan.config[:disable_xcpretty]
+        unless tests_exit_status == 0
+          UI.test_failure!("Test execution failed. Exit status: #{tests_exit_status}")
+        end
+        return
+      end
+
       result = TestResultParser.new.parse_result(test_results)
       SlackPoster.new.run(result)
 
@@ -148,8 +151,6 @@ module Scan
     end
 
     def test_results
-      return if Scan.config[:disable_xcpretty]
-
       temp_junit_report = Scan.cache[:temp_junit_report]
       return File.read(temp_junit_report) if temp_junit_report && File.file?(temp_junit_report)
 
@@ -165,13 +166,31 @@ module Scan
       File.read(Scan.cache[:temp_junit_report])
     end
 
+    def prelaunch_simulators
+      return unless Scan.devices.to_a.size > 0 # no devices selected, no sims to launch
+
+      # Return early unless the user wants to prelaunch simulators. Or if the user wants simulator logs
+      # then we must prelaunch simulators because Xcode's headless
+      # mode launches and shutsdown the simulators before we can collect the logs.
+      return unless Scan.config[:prelaunch_simulator] || Scan.config[:include_simulator_logs]
+
+      devices_to_shutdown = []
+      Scan.devices.each do |device|
+        devices_to_shutdown << device if device.state == "Shutdown"
+        device.boot
+      end
+      at_exit do
+        devices_to_shutdown.each(&:shutdown)
+      end
+    end
+
     def copy_simulator_logs
       return unless Scan.config[:include_simulator_logs]
 
       UI.header("Collecting system logs")
       Scan.devices.each do |device|
         log_identity = "#{device.name}_#{device.os_type}_#{device.os_version}"
-        FastlaneCore::Simulator.copy_logs(device, log_identity, Scan.config[:output_directory])
+        FastlaneCore::Simulator.copy_logs(device, log_identity, Scan.config[:output_directory], @device_boot_datetime)
       end
     end
 

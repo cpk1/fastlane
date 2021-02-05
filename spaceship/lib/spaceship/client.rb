@@ -1,3 +1,4 @@
+require 'babosa'
 require 'faraday' # HTTP Client
 require 'faraday-cookie_jar'
 require 'faraday_middleware'
@@ -5,9 +6,9 @@ require 'logger'
 require 'tmpdir'
 require 'cgi'
 require 'tempfile'
+require 'openssl'
 
 require 'fastlane/version'
-require_relative 'babosa_fix'
 require_relative 'helper/net_http_generic_request'
 require_relative 'helper/plist_middleware'
 require_relative 'helper/rels_middleware'
@@ -16,6 +17,7 @@ require_relative 'errors'
 require_relative 'tunes/errors'
 require_relative 'globals'
 require_relative 'provider'
+require_relative 'stats_middleware'
 
 Faraday::Utils.default_params_encoder = Faraday::FlatParamsEncoder
 
@@ -54,6 +56,8 @@ module Spaceship
     GatewayTimeoutError = Spaceship::GatewayTimeoutError
     InternalServerError = Spaceship::InternalServerError
     BadGatewayError = Spaceship::BadGatewayError
+    AccessForbiddenError = Spaceship::AccessForbiddenError
+    TooManyRequestsError = Spaceship::TooManyRequestsError
 
     def self.hostname
       raise "You must implement self.hostname"
@@ -193,21 +197,23 @@ module Spaceship
       self.new(cookie: another_client.instance_variable_get(:@cookie), current_team_id: another_client.team_id)
     end
 
-    def initialize(cookie: nil, current_team_id: nil)
+    def initialize(cookie: nil, current_team_id: nil, csrf_tokens: nil, timeout: nil)
       options = {
        request: {
-          timeout:       (ENV["SPACESHIP_TIMEOUT"] || 300).to_i,
-          open_timeout:  (ENV["SPACESHIP_TIMEOUT"] || 300).to_i
+          timeout:       (ENV["SPACESHIP_TIMEOUT"] || timeout || 300).to_i,
+          open_timeout:  (ENV["SPACESHIP_TIMEOUT"] || timeout || 300).to_i
         }
       }
       @current_team_id = current_team_id
+      @csrf_tokens = csrf_tokens
       @cookie = cookie || HTTP::CookieJar.new
+
       @client = Faraday.new(self.class.hostname, options) do |c|
         c.response(:json, content_type: /\bjson$/)
-        c.response(:xml, content_type: /\bxml$/)
         c.response(:plist, content_type: /\bplist$/)
         c.use(:cookie_jar, jar: @cookie)
         c.use(FaradayMiddleware::RelsMiddleware)
+        c.use(Spaceship::StatsMiddleware)
         c.adapter(Faraday.default_adapter)
 
         if ENV['SPACESHIP_DEBUG']
@@ -397,6 +403,7 @@ module Spaceship
     # This will also handle 2 step verification and 2 factor authentication
     #
     # It is called in `send_login_request` of sub classes (which the method `login`, above, transferred over to via `do_login`)
+    # rubocop:disable Metrics/PerceivedComplexity
     def send_shared_login_request(user, password)
       # Check if we have a cached/valid session
       #
@@ -500,9 +507,19 @@ module Spaceship
           # User Credentials are wrong
           raise InvalidUserCredentialsError.new, "Invalid username and password combination. Used '#{user}' as the username."
         elsif response.status == 412 && AUTH_TYPES.include?(response.body["authType"])
+
+          if try_upgrade_2fa_later(response)
+            store_cookie
+            fetch_olympus_session
+            return true
+          end
+
           # Need to acknowledge Apple ID and Privacy statement - https://github.com/fastlane/fastlane/issues/12577
           # Looking for status of 412 might be enough but might be safer to keep looking only at what is being reported
-          raise AppleIDAndPrivacyAcknowledgementNeeded.new, "Need to acknowledge to Apple's Apple ID and Privacy statement. Please manually log into https://appleid.apple.com (or https://appstoreconnect.apple.com) to acknowledge the statement."
+          raise AppleIDAndPrivacyAcknowledgementNeeded.new, "Need to acknowledge to Apple's Apple ID and Privacy statement. " \
+                                                            "Please manually log into https://appleid.apple.com (or https://appstoreconnect.apple.com) to acknowledge the statement. " \
+                                                            "Your account might also be asked to upgrade to 2FA. " \
+                                                            "Set SPACESHIP_SKIP_2FA_UPGRADE=1 for fastlane to automaticaly bypass 2FA upgrade if possible."
         elsif (response['Set-Cookie'] || "").include?("itctx")
           raise "Looks like your Apple ID is not enabled for App Store Connect, make sure to be able to login online"
         else
@@ -511,6 +528,7 @@ module Spaceship
         end
       end
     end
+    # rubocop:enable Metrics/PerceivedComplexity
 
     # Get the `itctx` from the new (22nd May 2017) API endpoint "olympus"
     # Update (29th March 2019) olympus migrates to new appstoreconnect API
@@ -628,7 +646,8 @@ module Spaceship
         Faraday::TimeoutError,
         BadGatewayError,
         AppleTimeoutError,
-        GatewayTimeoutError => ex
+        GatewayTimeoutError,
+        AccessForbiddenError => ex
       tries -= 1
       unless tries.zero?
         msg = "Timeout received: '#{ex.class}', '#{ex.message}'. Retrying after 3 seconds (remaining: #{tries})..."
@@ -636,6 +655,17 @@ module Spaceship
         logger.warn(msg)
 
         sleep(3) unless Object.const_defined?("SpecHelper")
+        retry
+      end
+      raise ex # re-raise the exception
+    rescue TooManyRequestsError => ex
+      tries -= 1
+      unless tries.zero?
+        msg = "Timeout received: '#{ex.class}', '#{ex.message}'. Retrying after #{ex.retry_after} seconds (remaining: #{tries})..."
+        puts(msg) if Spaceship::Globals.verbose?
+        logger.warn(msg)
+
+        sleep(ex.retry_after) unless Object.const_defined?("SpecHelper")
         retry
       end
       raise ex # re-raise the exception
@@ -852,9 +882,7 @@ module Spaceship
 
         resp_hash = response.to_hash
         if resp_hash[:status] == 401
-          msg = "Auth lost"
-          logger.warn(msg)
-          raise UnauthorizedAccessError.new, "Unauthorized Access"
+          handle_401(response)
         end
 
         if response.body.to_s.include?("<title>302 Found</title>")
@@ -865,8 +893,22 @@ module Spaceship
           raise BadGatewayError.new, "Apple 502 detected - this might be temporary server error, try again later"
         end
 
+        if resp_hash[:status] == 403
+          msg = "Access forbidden"
+          logger.warn(msg)
+          raise AccessForbiddenError.new, msg
+        elsif resp_hash[:status] == 429
+          raise TooManyRequestsError, resp_hash
+        end
+
         return response
       end
+    end
+
+    def handle_401(response)
+      msg = "Auth lost"
+      logger.warn(msg)
+      raise UnauthorizedAccessError.new, "Unauthorized Access"
     end
 
     def send_request_auto_paginate(method, url_or_path, params, headers, &block)
@@ -895,3 +937,4 @@ module Spaceship
 end
 
 require 'spaceship/two_step_or_factor_client'
+require 'spaceship/upgrade_2fa_later_client'
